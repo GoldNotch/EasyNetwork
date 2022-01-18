@@ -2,7 +2,7 @@
 #define EASYNETWORK_CONNECTION_COMPILED
 
 #pragma once
-#include <asio.hpp>
+#include <asio.hpp>//set your path to asio.hpp file
 using asio::ip::tcp;
 #include <string>
 #include <cstdlib>
