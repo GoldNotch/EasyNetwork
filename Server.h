@@ -23,8 +23,8 @@ namespace EasyNetwork
 		void start(int port);
 		void stop();
 		//broadcast buffer from one connection to other connected clients
-		void broadcast(const TemplatedConnection* const from, const BufferType& buffer);
 		asio::io_context::count_type poll_events();
+		void broadcast(const TemplatedConnection* const from, const BufferType& buffer);
 
 		//callback to handle connection of new client
 		std::function<void(TemplatedServer* const, TemplatedConnection* const)> connect_handler = nullptr;
@@ -38,18 +38,20 @@ namespace EasyNetwork
 		ErrorHandler error_handler = nullptr;
 
 	protected:
-		asio::io_context io_ctx;
-		tcp::endpoint endpoint;
-		std::atomic<bool> running = false;
-		void server_main();
-		std::thread* server_thread = nullptr;//thread to wait while client connected
+		asio::io_context	io_ctx;
+		tcp::endpoint		endpoint;
+		std::atomic<bool>	running = false;
+		void				server_main();
+		std::unique_ptr<tcp::acceptor> server;
+		std::unique_ptr<std::thread> server_thread;//thread to wait while client connected
 
-		std::set<TemplatedConnection*> connections;
-		asio::thread_pool pool;//thread pool to handle client
+		std::set<TemplatedConnection*>	connections;
+		std::mutex connections_mutex;
+		asio::thread_pool				pool;//thread pool to handle client
 
 		std::size_t queue_capacity;//for queues in connections
-		float ping_frequency;
-		float ping_timeout;
+		float		ping_frequency;
+		float		ping_timeout;
 	};	
 
 	template<typename BufferType, template<typename> class QueueType>
@@ -79,8 +81,7 @@ namespace EasyNetwork
 		if (!running)
 		{
 			endpoint = tcp::endpoint(tcp::v4(), port);
-			running = true;
-			server_thread = new std::thread(&Server::server_main, this);
+			server_thread = std::make_unique<std::thread>(&Server::server_main, this);
 		}
 	}
 
@@ -94,11 +95,21 @@ namespace EasyNetwork
 	template<typename BufferType, template<typename> class QueueType>
 	inline void Server<BufferType, QueueType>::stop()
 	{
-		if (running) {
-			pool.join();
+		if (running) 
+		{
+			if (error_handler)
+				error_handler("Server::Stop", 0, "Server is stoping");
 			running = false;
+			connections_mutex.lock();
+			for (TemplatedConnection* conn : connections)
+				conn->close();
+			connections_mutex.unlock();
+			pool.join();
+			server.reset();
 			server_thread->join();
-			delete server_thread;
+			server_thread.reset();
+			if (error_handler)
+				error_handler("Server::Stop", 0, "Server stopped");
 		}
 	}
 
@@ -106,6 +117,7 @@ namespace EasyNetwork
 	inline void Server<BufferType, QueueType>::broadcast(const TemplatedConnection* const from, const BufferType& buffer)
 	{
 		std::size_t sent_count = 0;
+		std::lock_guard<std::mutex> lk(connections_mutex);
 		for (TemplatedConnection* conn : connections) {
 			if (from != conn) {
 				auto& new_buffer = conn->enqueue_buffer();
@@ -118,24 +130,23 @@ namespace EasyNetwork
 	template<typename BufferType, template<typename> class QueueType>
 	inline void Server<BufferType, QueueType>::server_main()
 	{
-		tcp::acceptor server(io_ctx, endpoint);
+		server = std::make_unique<tcp::acceptor>(io_ctx, endpoint);
 		//enable NO_DELAY mode
-		server.set_option(tcp::no_delay(true));
-
-		while (running)
+		server->set_option(tcp::no_delay(true));
+		running = true;
+		while (is_started() && running)
 		{
 			TemplatedConnection* conn = new TemplatedConnection(io_ctx, queue_capacity);
 			conn->error_handler = error_handler;
 			conn->receive_handler = std::bind(receive_handler, this, conn,
 																		std::placeholders::_1);
-			if (!TemplatedConnection::accept(server, *conn))
+			if (!TemplatedConnection::accept(server.get(), *conn))
 			{
 				delete conn;
 				continue;
 			}
-			
+			std::lock_guard<std::mutex> lk(connections_mutex);
 			connections.insert(conn);
-
 			asio::post(pool, [this, conn]()
 				{			
 					if (connect_handler) connect_handler(this, conn);
@@ -159,13 +170,17 @@ namespace EasyNetwork
 						poll_events();
 					}
 					//disconnect
-					if (disconnect_handler)
+					if (disconnect_handler && running)
 						disconnect_handler(this, conn);
+					std::lock_guard<std::mutex> lk(connections_mutex);
 					connections.erase(conn);
 					delete conn;
+					if (error_handler)
+						error_handler("Server::Server_main", 0, "connection handler exited");
 				});
 		}
-		server.close();
+		if (error_handler)
+			error_handler("Server::Server_main", 0, "Server main exited");
 	}
 };
 

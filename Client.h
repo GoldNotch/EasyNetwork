@@ -75,6 +75,8 @@ namespace EasyNetwork {
 						poll_events();
 						std::this_thread::sleep_for(std::chrono::microseconds(2));
 					}
+					if (error_handler)
+						error_handler("Client::IO_Thread", 0, "Thread exited");
 				});
 		return success;
 	}
@@ -82,11 +84,18 @@ namespace EasyNetwork {
 	template<typename BufferType, template<typename> class QueueType>
 	inline void Client<BufferType, QueueType>::disconnect()
 	{
-		connection.close();
-		if (io_thread) {
-			io_thread->join();
-			delete io_thread;
-			io_thread = nullptr;
+		if (is_connected()) 
+		{
+			if (error_handler)
+				error_handler("Client::Disconnect", 0, "client is closing");
+			connection.close();
+			if (io_thread)
+			{
+				io_thread->join();
+				delete io_thread;
+			}
+			if (error_handler)
+				error_handler("Client::Disconnect", 0, "client closed");
 		}
 	}
 

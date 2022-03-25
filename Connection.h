@@ -71,7 +71,7 @@ namespace EasyNetwork
 		ErrorHandler error_handler = nullptr;
 
 		//accept connection on server side. Return true if acception is successful
-		static bool accept(tcp::acceptor& acceptor, Connection& connection);
+		static bool accept(tcp::acceptor* acceptor, Connection& connection);
 
 	protected:
 		//---------- asio -------------
@@ -118,12 +118,14 @@ namespace EasyNetwork
 	}
 
 	template<typename BufferType, template<typename> class QueueType>
-	inline bool Connection<BufferType, QueueType>::accept(tcp::acceptor& acceptor, Connection& connection)
+	inline bool Connection<BufferType, QueueType>::accept(tcp::acceptor* acceptor, Connection& connection)
 	{
 		asio::error_code ec;
-		acceptor.accept(connection.socket, ec);
-		if (ec.value() && connection.error_handler)
+		acceptor->accept(connection.socket, ec);
+		if (ec.value() && connection.error_handler) {
 			connection.error_handler("Connection::accept", ec.value(), ec.message().c_str());
+			return false;
+		}
 		connection._is_connected = ec.value() == 0;
 		//enable NO_DELAY mode
 		connection.socket.set_option(tcp::no_delay(true));
@@ -156,12 +158,18 @@ namespace EasyNetwork
 	template<typename BufferType, template<typename> class QueueType>
 	inline void Connection<BufferType, QueueType>::close()
 	{
-		poll_mutex.lock();
-		_is_connected = false;
-		socket.close();
-		if (socket.is_open())
-			socket.shutdown(socket.shutdown_both);
-		poll_mutex.unlock();
+		if (_is_connected) 
+		{
+			std::lock_guard<std::mutex> lk(poll_mutex);
+			if (error_handler)
+				error_handler("Connection::Close", 0, "Connection is closing");
+			_is_connected = false;
+			socket.close();
+			if (socket.is_open())
+				socket.shutdown(socket.shutdown_both);
+			if (error_handler)
+				error_handler("Connection::Close", 0, "Connection closed");
+		}
 	}
 
 	template<typename BufferType, template<typename> class QueueType>
@@ -173,7 +181,7 @@ namespace EasyNetwork
 	template<typename BufferType, template<typename> class QueueType>
 	inline void Connection<BufferType, QueueType>::poll_events()
 	{
-		poll_mutex.lock();
+		std::lock_guard<std::mutex> lk(poll_mutex);
 		//if can receive something - receive
 		if (!is_receiving && is_connected() && socket.available() > 0)
 		{
@@ -190,12 +198,12 @@ namespace EasyNetwork
 			recv_queue.pop();
 			--received_buffers_count;
 		}
-		poll_mutex.unlock();
 	}
 
 	template<typename BufferType, template<typename> class QueueType>
 	inline BufferType& Connection<BufferType, QueueType>::enqueue_buffer()
 	{
+		std::lock_guard<std::mutex> lk(send_mutex);
 		return sent_queue.alloc();
 	}
 
@@ -212,8 +220,9 @@ namespace EasyNetwork
 				asio::bind_executor(_strand, handler));
 		}
 		++buffers_to_send;
+		std::size_t size = sent_queue.size();
 		send_mutex.unlock();
-		if (buffers_to_send > sent_queue.size())
+		if (buffers_to_send > size)
 			error_handler("Connection::send_buffer_async", -2, "Buffer wasn't allocated for sending");
 	}
 
@@ -235,16 +244,23 @@ namespace EasyNetwork
 		send_mutex.lock();
 		buffers_to_send--;
 		sent_queue.pop();
+		std::size_t size = sent_queue.size();
 		send_mutex.unlock();
 
 		bool error_occured = (ec.value() || sent_size < sizeof(BufferType));
 		if (error_occured && error_handler)
 			error_handler("Connection::on_buffer_sent", ec.value(), ec.message().c_str());
 
-		if (buffers_to_send > sent_queue.size()) 
+		if (buffers_to_send > size)
 		{
 			error_handler("Connection::on_buffer_sent", -1, "race_condition::buffers_to_send > sent_queue.size()");
 			error_occured = true;
+		}
+
+		if (error_occured)
+		{
+			close();
+			return;
 		}
 
 		//unlock waiting for send
@@ -272,17 +288,21 @@ namespace EasyNetwork
 			recv_queue.pop();
 		else
 			++received_buffers_count;
+		std::size_t size = recv_queue.size();
 		poll_mutex.unlock();
 
 		if (ec.value() && error_handler)
 			error_handler("Connection::on_buffer_received", ec.value(), ec.message().c_str());
 
-		if (received_buffers_count > recv_queue.size())
+		if (received_buffers_count > size)
 			error_handler("Connection::on_buffer_received", -1, "race condition::received_buffers_count >= recv_queue.size()");
+		
 		
 		if (is_connected() && socket.available() > 0 && ec.value() != 0)
 		{
+			poll_mutex.lock();
 			void* buffer = &(recv_queue.alloc());
+			poll_mutex.unlock();
 			auto handler = std::bind(&Connection::on_buffer_received, this, std::placeholders::_1, std::placeholders::_2);
 			asio::async_read(socket, asio::buffer((void*)buffer, sizeof(BufferType)),
 				asio::bind_executor(_strand, handler));
